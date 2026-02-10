@@ -12,19 +12,39 @@ using Unity.Collections.LowLevel.Unsafe;
 using Unity.Jobs;
 using Unity.Mathematics;
 using UnityEngine;
+using UnityEngine.Networking;
 
 namespace GaussianSplatting.Runtime
 {
     /// <summary>
     /// Runtime Gaussian Splat asset creator that processes PLY/SPZ files at runtime.
-    /// Reads from StreamingAssets, processes with fixed "High" quality configuration,
-    /// and outputs raw binary files to PersistentDataPath.
+    /// Supports multiple file sources with independent module integration.
+    /// 
+    /// File Organization:
+    /// - StreamingAssets/GaussianSplats/: Manually added source files (PLY/SPZ)
+    /// - PersistentDataPath/GaussianSplats/sources/: Additional source files (for Marble AI module, etc)
+    /// - PersistentDataPath/GaussianSplats/{assetName}/: Processed cache for each asset
+    /// 
+    /// Integration Pattern:
+    /// Other modules (e.g., Marble AI) can register their own source paths without tight coupling:
+    ///   gaussianSplatCreator.RegisterSourcePath("/path/to/marble/ai/models");
     /// 
     /// Usage:
     ///   var processor = gameObject.AddComponent&lt;GaussianSplatRuntimeAssetCreator&gt;();
     ///   processor.OnProgress += (status, progress) => Debug.Log($"{status}: {progress:P0}");
     ///   processor.OnComplete += (asset, success) => Debug.Log(success ? "Done!" : "Failed!");
+    ///   
+    ///   // Load from StreamingAssets or source paths
     ///   processor.StartCoroutine(processor.LoadAndProcessAsync("mymodel"));
+    ///   
+    ///   // Register custom path from another module (Marble AI, etc)
+    ///   processor.RegisterSourcePath("/path/to/ai/module/models");
+    ///   
+    ///   // List all available assets
+    ///   var assets = processor.ListAvailableAssets();
+    ///   
+    ///   // Process a file from custom path
+    ///   processor.StartCoroutine(processor.ProcessFileAsync("mymodel", "/custom/path/mymodel.ply"));
     /// </summary>
     // Simple wrapper for binary data at runtime (mimics TextAsset)
     public class BinaryDataAsset : ScriptableObject
@@ -117,6 +137,13 @@ namespace GaussianSplatting.Runtime
 
         [SerializeField] QualityPreset m_QualityPreset = QualityPreset.High;
 
+        public enum AssetSource
+        {
+            StreamingAssets,
+            Downloaded,
+            Manual
+        }
+
         [System.Serializable]
         class AssetMetadata
         {
@@ -130,6 +157,20 @@ namespace GaussianSplatting.Runtime
             public bool hasChunks;
             public float boundsMinX, boundsMinY, boundsMinZ;
             public float boundsMaxX, boundsMaxY, boundsMaxZ;
+            public int source = (int)AssetSource.StreamingAssets;
+            public string sourceFilename;
+            public long sourceFileSize;
+            public string sourceUrl;
+            public long createdTimestamp;
+        }
+
+        public struct AssetInfo
+        {
+            public string name;
+            public AssetSource source;
+            public string sourceFile;
+            public long fileSize;
+            public bool isCached;
         }
 
         QualitySettings GetQualitySettings()
@@ -151,10 +192,193 @@ namespace GaussianSplatting.Runtime
             set => m_QualityPreset = value;
         }
 
+        /// <summary>List all available Gaussian Splat assets from all sources</summary>
+        public List<AssetInfo> ListAvailableAssets()
+        {
+            var assets = new Dictionary<string, AssetInfo>();
+
+            // Discover StreamingAssets
+            string streamingPath = Path.Combine(Application.streamingAssetsPath, "GaussianSplats");
+            if (Directory.Exists(streamingPath))
+            {
+                foreach (var file in Directory.GetFiles(streamingPath, "*.ply").Concat(Directory.GetFiles(streamingPath, "*.spz")))
+                {
+                    string assetName = Path.GetFileNameWithoutExtension(file);
+                    if (!assets.ContainsKey(assetName))
+                    {
+                        assets[assetName] = new AssetInfo
+                        {
+                            name = assetName,
+                            source = AssetSource.StreamingAssets,
+                            sourceFile = file,
+                            fileSize = new FileInfo(file).Length,
+                            isCached = IsCached(assetName)
+                        };
+                    }
+                }
+            }
+
+            // Discover files from other sources (custom paths, Marble AI module, etc)
+            string otherSourcesPath = GetOtherSourcesPath();
+            if (Directory.Exists(otherSourcesPath))
+            {
+                foreach (var file in Directory.GetFiles(otherSourcesPath, "*.ply").Concat(Directory.GetFiles(otherSourcesPath, "*.spz")))
+                {
+                    string assetName = Path.GetFileNameWithoutExtension(file);
+                    if (!assets.ContainsKey(assetName))  // StreamingAssets takes priority
+                    {
+                        assets[assetName] = new AssetInfo
+                        {
+                            name = assetName,
+                            source = AssetSource.Manual,
+                            sourceFile = file,
+                            fileSize = new FileInfo(file).Length,
+                            isCached = IsCached(assetName)
+                        };
+                    }
+                }
+            }
+
+            // Check custom registered source paths
+            foreach (var customPath in m_CustomSourcePaths)
+            {
+                if (Directory.Exists(customPath))
+                {
+                    foreach (var file in Directory.GetFiles(customPath, "*.ply").Concat(Directory.GetFiles(customPath, "*.spz")))
+                    {
+                        string assetName = Path.GetFileNameWithoutExtension(file);
+                        if (!assets.ContainsKey(assetName))  // StreamingAssets takes priority
+                        {
+                            assets[assetName] = new AssetInfo
+                            {
+                                name = assetName,
+                                source = AssetSource.Manual,
+                                sourceFile = file,
+                                fileSize = new FileInfo(file).Length,
+                                isCached = IsCached(assetName)
+                            };
+                        }
+                    }
+                }
+            }
+
+            return assets.Values.ToList();
+        }
+
+        /// <summary>Get all available source paths for file discovery</summary>
+        public List<string> GetSourcePaths()
+        {
+            var paths = new List<string>
+            {
+                Path.Combine(Application.streamingAssetsPath, "GaussianSplats"),
+                GetOtherSourcesPath()
+            };
+            paths.AddRange(m_CustomSourcePaths);
+            return paths;
+        }
+
+        /// <summary>Register a custom source path for file discovery (e.g., from Marble AI module)</summary>
+        public void RegisterSourcePath(string path)
+        {
+            if (!Directory.Exists(path))
+            {
+                Debug.LogWarning($"Source path does not exist: {path}");
+                return;
+            }
+            
+            if (!m_CustomSourcePaths.Contains(path))
+            {
+                m_CustomSourcePaths.Add(path);
+                Debug.Log($"Registered source path: {path}");
+            }
+        }
+
+        static List<string> m_CustomSourcePaths = new();
+
+        /// <summary>Process a file from a custom path (e.g., from another module)</summary>
+        public IEnumerator ProcessFileAsync(string assetName, string filePath)
+        {
+            if (!File.Exists(filePath))
+            {
+                Debug.LogError($"File not found: {filePath}");
+                OnComplete?.Invoke(null, false);
+                yield break;
+            }
+
+            string cacheFolder = GetCachePath(assetName);
+            bool success = ProcessAndCacheInternal(assetName, cacheFolder, filePath);
+
+            if (success)
+            {
+                OnProgress?.Invoke("Complete", 1.0f);
+                OnComplete?.Invoke(LoadCachedAsset(assetName, cacheFolder), true);
+            }
+            else
+            {
+                OnComplete?.Invoke(null, false);
+            }
+            
+            yield break;
+        }
+
+        /// <summary>Delete an asset and all associated files</summary>
+        public bool DeleteAsset(string assetName, bool deleteSource = false)
+        {
+            try
+            {
+                // Delete cache
+                string cacheFolder = GetCachePath(assetName);
+                if (Directory.Exists(cacheFolder))
+                {
+                    Directory.Delete(cacheFolder, true);
+                    Debug.Log($"Deleted cache for {assetName}");
+                }
+
+                // Optionally delete source file
+                if (deleteSource)
+                {
+                    string sourcePath = GetOtherSourcesPath();
+                    foreach (var ext in new[] { ".ply", ".spz" })
+                    {
+                        string file = Path.Combine(sourcePath, assetName + ext);
+                        if (File.Exists(file))
+                        {
+                            File.Delete(file);
+                            Debug.Log($"Deleted source file {file}");
+                        }
+                    }
+                }
+
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"Error deleting {assetName}: {ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>Get metadata for a specific asset</summary>
+        public AssetInfo? GetAssetInfo(string assetName)
+        {
+            var allAssets = ListAvailableAssets();
+            return allAssets.FirstOrDefault(a => a.name == assetName);
+        }
+
+        string GetOtherSourcesPath()
+        {
+            return Path.Combine(Application.persistentDataPath, "GaussianSplats", "sources");
+        }
 
         string GetCachePath(string assetName)
         {
             return Path.Combine(Application.persistentDataPath, "GaussianSplats", assetName);
+        }
+
+        bool IsCached(string assetName)
+        {
+            string cacheFolder = GetCachePath(assetName);
+            return File.Exists(Path.Combine(cacheFolder, "metadata.json"));
         }
 
         // Main entry point for loading and processing
@@ -223,6 +447,11 @@ namespace GaussianSplatting.Runtime
             }
         }
 
+        GaussianSplatAsset LoadCachedAsset(string assetName, string cacheFolder)
+        {
+            return TryLoadFromCache(assetName, cacheFolder, out var asset) ? asset : null;
+        }
+
         void LoadBinaryData(string cacheFolder, GaussianSplatAsset asset)
         {
             try
@@ -283,7 +512,7 @@ namespace GaussianSplatting.Runtime
             yield return null;
         }
 
-        bool ProcessAndCacheInternal(string assetName, string cacheFolder)
+        bool ProcessAndCacheInternal(string assetName, string cacheFolder, string sourceFile = null)
         {
             NativeArray<InputSplatData> inputSplats = default;
 
@@ -291,17 +520,22 @@ namespace GaussianSplatting.Runtime
             {
                 OnProgress?.Invoke("Reading file", 0.1f);
 
-                // Read input file from StreamingAssets
-                string sourceFile = FindSourceFile(assetName);
-                if (string.IsNullOrEmpty(sourceFile))
+                // Find or use provided source file
+                string sourceFilePath = sourceFile;
+                if (string.IsNullOrEmpty(sourceFilePath))
                 {
-                    throw new FileNotFoundException($"Could not find {assetName}.ply or {assetName}.spz in StreamingAssets");
+                    sourceFilePath = FindSourceFile(assetName);
+                }
+
+                if (string.IsNullOrEmpty(sourceFilePath))
+                {
+                    throw new FileNotFoundException($"Could not find {assetName}.ply or {assetName}.spz in StreamingAssets or Downloads");
                 }
 
                 // Read and parse input data
-                GaussianFileReader.ReadFile(sourceFile, out inputSplats);
+                GaussianFileReader.ReadFile(sourceFilePath, out inputSplats);
                 if (inputSplats.Length == 0)
-                    throw new InvalidOperationException($"Failed to read any splat data from {sourceFile}");
+                    throw new InvalidOperationException($"Failed to read any splat data from {sourceFilePath}");
 
                 OnProgress?.Invoke("Calculating bounds", 0.2f);
 
@@ -348,7 +582,9 @@ namespace GaussianSplatting.Runtime
 
                 // Save metadata
                 OnProgress?.Invoke("Saving metadata", 0.90f);
-                SaveMetadata(cacheFolder, assetName, inputSplats.Length, boundsMin, boundsMax, quality, useChunks);
+                FileInfo sourceFileInfo = new FileInfo(sourceFilePath);
+                SaveMetadata(cacheFolder, assetName, inputSplats.Length, boundsMin, boundsMax, quality, useChunks, 
+                    GetAssetSource(sourceFilePath), sourceFileInfo.Name, sourceFileInfo.Length);
 
                 OnProgress?.Invoke("Creating asset", 0.95f);
 
@@ -376,6 +612,7 @@ namespace GaussianSplatting.Runtime
 
         string FindSourceFile(string assetName)
         {
+            // Check StreamingAssets first
             string gaDir = Path.Combine(Application.streamingAssetsPath, "GaussianSplats");
             
             string plyPath = Path.Combine(gaDir, assetName + ".ply");
@@ -386,7 +623,39 @@ namespace GaussianSplatting.Runtime
             if (File.Exists(spzPath))
                 return spzPath;
 
+            // Check other sources folder
+            string otherSourcesDir = GetOtherSourcesPath();
+            plyPath = Path.Combine(otherSourcesDir, assetName + ".ply");
+            if (File.Exists(plyPath))
+                return plyPath;
+
+            spzPath = Path.Combine(otherSourcesDir, assetName + ".spz");
+            if (File.Exists(spzPath))
+                return spzPath;
+
+            // Check custom registered paths
+            foreach (var customPath in m_CustomSourcePaths)
+            {
+                plyPath = Path.Combine(customPath, assetName + ".ply");
+                if (File.Exists(plyPath))
+                    return plyPath;
+
+                spzPath = Path.Combine(customPath, assetName + ".spz");
+                if (File.Exists(spzPath))
+                    return spzPath;
+            }
+
             return null;
+        }
+
+        AssetSource GetAssetSource(string sourceFilePath)
+        {
+            if (sourceFilePath.Contains(Application.streamingAssetsPath))
+                return AssetSource.StreamingAssets;
+            else if (sourceFilePath.Contains(GetOtherSourcesPath()))
+                return AssetSource.Manual;
+            else
+                return AssetSource.Manual;
         }
 
         void CalcBounds(NativeArray<InputSplatData> splatData, ref float3 boundsMin, ref float3 boundsMax)
@@ -399,7 +668,7 @@ namespace GaussianSplatting.Runtime
             }
         }
 
-        void SaveMetadata(string cacheFolder, string assetName, int splatCount, float3 boundsMin, float3 boundsMax, QualitySettings quality, bool useChunks)
+        void SaveMetadata(string cacheFolder, string assetName, int splatCount, float3 boundsMin, float3 boundsMax, QualitySettings quality, bool useChunks, AssetSource source, string sourceFilename, long sourceFileSize)
         {
             var metadata = new AssetMetadata
             {
@@ -415,7 +684,11 @@ namespace GaussianSplatting.Runtime
                 boundsMinZ = boundsMin.z,
                 boundsMaxX = boundsMax.x,
                 boundsMaxY = boundsMax.y,
-                boundsMaxZ = boundsMax.z
+                boundsMaxZ = boundsMax.z,
+                source = (int)source,
+                sourceFilename = sourceFilename,
+                sourceFileSize = sourceFileSize,
+                createdTimestamp = System.DateTimeOffset.UtcNow.ToUnixTimeSeconds()
             };
 
             string json = JsonUtility.ToJson(metadata);
