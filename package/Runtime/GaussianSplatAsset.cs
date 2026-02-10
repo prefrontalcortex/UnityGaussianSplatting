@@ -118,13 +118,58 @@ namespace GaussianSplatting.Runtime
             m_DataHash = hash;
         }
 
-        public void SetAssetFiles(TextAsset dataChunk, TextAsset dataPos, TextAsset dataOther, TextAsset dataColor, TextAsset dataSh)
+        public void SetAssetFiles(UnityEngine.Object dataChunk, UnityEngine.Object dataPos, UnityEngine.Object dataOther, UnityEngine.Object dataColor, UnityEngine.Object dataSh)
         {
             m_ChunkData = dataChunk;
             m_PosData = dataPos;
             m_OtherData = dataOther;
             m_ColorData = dataColor;
             m_SHData = dataSh;
+        }
+
+        // Helper methods for renderer to safely access data from either TextAsset or BinaryDataAsset
+        public static T[] GetDataGeneric<T>(UnityEngine.Object asset) where T : unmanaged
+        {
+            if (asset == null)
+                return new T[0];
+
+            if (asset is TextAsset textAsset)
+            {
+                var nativeArray = textAsset.GetData<T>();
+                T[] result = new T[nativeArray.Length];
+                nativeArray.CopyTo(result);
+                nativeArray.Dispose();
+                return result;
+            }
+            
+            // Try to call GetData via reflection/dynamic dispatch
+            var method = asset.GetType().GetMethod("GetData", 
+                System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+            if (method != null && method.IsGenericMethodDefinition)
+            {
+                method = method.MakeGenericMethod(typeof(T));
+                if (method.Invoke(asset, null) is T[] result)
+                    return result;
+            }
+
+            return new T[0];
+        }
+
+        public static int GetDataSize(UnityEngine.Object asset)
+        {
+            if (asset == null)
+                return 0;
+
+            if (asset is TextAsset textAsset)
+                return textAsset.bytes?.Length ?? 0;
+
+            // Check if it has dataSize property
+            var property = asset.GetType().GetProperty("dataSize",
+                System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.Instance);
+            if (property != null && property.GetValue(asset) is int size)
+                return size;
+
+            return 0;
         }
 
         public static int GetOtherSizeNoSHIndex(VectorFormat scaleFormat)
@@ -207,12 +252,12 @@ namespace GaussianSplatting.Runtime
         [SerializeField] SHFormat m_SHFormat = SHFormat.Norm11;
         [SerializeField] ColorFormat m_ColorFormat;
 
-        [SerializeField] TextAsset m_PosData;
-        [SerializeField] TextAsset m_ColorData;
-        [SerializeField] TextAsset m_OtherData;
-        [SerializeField] TextAsset m_SHData;
+        [SerializeField] UnityEngine.Object m_PosData;
+        [SerializeField] UnityEngine.Object m_ColorData;
+        [SerializeField] UnityEngine.Object m_OtherData;
+        [SerializeField] UnityEngine.Object m_SHData;
         // Chunk data is optional (if data formats are fully lossless then there's no chunking)
-        [SerializeField] TextAsset m_ChunkData;
+        [SerializeField] UnityEngine.Object m_ChunkData;
 
         [SerializeField] CameraInfo[] m_Cameras;
 
@@ -221,11 +266,11 @@ namespace GaussianSplatting.Runtime
         public SHFormat shFormat => m_SHFormat;
         public ColorFormat colorFormat => m_ColorFormat;
 
-        public TextAsset posData => m_PosData;
-        public TextAsset colorData => m_ColorData;
-        public TextAsset otherData => m_OtherData;
-        public TextAsset shData => m_SHData;
-        public TextAsset chunkData => m_ChunkData;
+        public UnityEngine.Object posData => m_PosData;
+        public UnityEngine.Object colorData => m_ColorData;
+        public UnityEngine.Object otherData => m_OtherData;
+        public UnityEngine.Object shData => m_SHData;
+        public UnityEngine.Object chunkData => m_ChunkData;
         public CameraInfo[] cameras => m_Cameras;
 
         public struct ChunkInfo
@@ -243,5 +288,14 @@ namespace GaussianSplatting.Runtime
             public Vector3 axisX, axisY, axisZ;
             public float fov;
         }
+    }
+
+    // Extension methods for UnityEngine.Object to support both TextAsset and BinaryDataAsset
+    public static class GaussianSplatAssetExtensions
+    {
+        public static int GetDataSize(this UnityEngine.Object obj) => GaussianSplatAsset.GetDataSize(obj);
+
+        public static T[] GetData<T>(this UnityEngine.Object obj) where T : unmanaged
+            => GaussianSplatAsset.GetDataGeneric<T>(obj);
     }
 }

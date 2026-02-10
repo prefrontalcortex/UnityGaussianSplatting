@@ -26,6 +26,38 @@ namespace GaussianSplatting.Runtime
     ///   processor.OnComplete += (asset, success) => Debug.Log(success ? "Done!" : "Failed!");
     ///   processor.StartCoroutine(processor.LoadAndProcessAsync("mymodel"));
     /// </summary>
+    // Simple wrapper for binary data at runtime (mimics TextAsset)
+    public class BinaryDataAsset : ScriptableObject
+    {
+        [SerializeField] byte[] m_Data;
+        public byte[] bytes => m_Data;
+        public int dataSize => m_Data?.Length ?? 0;
+        
+        public void SetBytes(byte[] data) => m_Data = data;
+        
+        // Mimic TextAsset.GetData<T>() API for compatibility with renderer
+        public T[] GetData<T>() where T : unmanaged
+        {
+            if (m_Data == null || m_Data.Length == 0)
+                return new T[0];
+            
+            unsafe
+            {
+                int elementSize = sizeof(T);
+                int elementCount = m_Data.Length / elementSize;
+                T[] result = new T[elementCount];
+                
+                fixed (byte* srcPtr = m_Data)
+                fixed (T* dstPtr = result)
+                {
+                    Buffer.MemoryCopy(srcPtr, dstPtr, m_Data.Length, m_Data.Length);
+                }
+                
+                return result;
+            }
+        }
+    }
+
     public class GaussianSplatRuntimeAssetCreator : MonoBehaviour
     {
         public delegate void ProgressCallback(string status, float progress);
@@ -124,13 +156,8 @@ namespace GaussianSplatting.Runtime
 
                 asset.Initialize(metadata.splatCount, formatPos, formatScale, formatColor, formatSH, boundsMin, boundsMax, null);
 
-                // Load binary data
-                if (metadata.hasChunks)
-                    LoadBinaryData(cacheFolder, "data.chk", asset);
-                LoadBinaryData(cacheFolder, "data.pos", asset);
-                LoadBinaryData(cacheFolder, "data.oth", asset);
-                LoadBinaryData(cacheFolder, "data.col", asset);
-                LoadBinaryData(cacheFolder, "data.shs", asset);
+                // Load binary data from disk
+                LoadBinaryData(cacheFolder, asset);
 
                 Debug.Log($"Loaded Gaussian Splat '{assetName}' from cache ({metadata.splatCount:N0} splats)");
                 return true;
@@ -142,15 +169,40 @@ namespace GaussianSplatting.Runtime
             }
         }
 
-        void LoadBinaryData(string cacheFolder, string filename, GaussianSplatAsset asset)
+        void LoadBinaryData(string cacheFolder, GaussianSplatAsset asset)
         {
-            string filePath = Path.Combine(cacheFolder, filename);
+            try
+            {
+                // Load all binary data files from disk as BinaryDataAssets
+                UnityEngine.Object posData = LoadBinaryDataAsset(Path.Combine(cacheFolder, "data.pos"));
+                UnityEngine.Object otherData = LoadBinaryDataAsset(Path.Combine(cacheFolder, "data.oth"));
+                UnityEngine.Object colorData = LoadBinaryDataAsset(Path.Combine(cacheFolder, "data.col"));
+                UnityEngine.Object shData = LoadBinaryDataAsset(Path.Combine(cacheFolder, "data.shs"));
+                UnityEngine.Object chunkData = null;
+                
+                // Chunk data is optional
+                string chunkPath = Path.Combine(cacheFolder, "data.chk");
+                if (File.Exists(chunkPath))
+                    chunkData = LoadBinaryDataAsset(chunkPath);
+
+                // Set the data on the asset
+                asset.SetAssetFiles(chunkData, posData, otherData, colorData, shData);
+            }
+            catch (Exception ex)
+            {
+                Debug.LogError($"Error loading binary data: {ex.Message}");
+            }
+        }
+
+        BinaryDataAsset LoadBinaryDataAsset(string filePath)
+        {
             if (!File.Exists(filePath))
-                return;
+                return null;
 
             byte[] data = File.ReadAllBytes(filePath);
-            // Note: You would need to add a method to GaussianSplatAsset to accept raw binary data
-            // For now, we'll store the path and load manually when needed
+            BinaryDataAsset asset = ScriptableObject.CreateInstance<BinaryDataAsset>();
+            asset.SetBytes(data);
+            return asset;
         }
 
         IEnumerator ProcessAndCacheAsync(string assetName, string cacheFolder)
@@ -251,6 +303,9 @@ namespace GaussianSplatting.Runtime
                 var asset = ScriptableObject.CreateInstance<GaussianSplatAsset>();
                 asset.name = assetName;
                 asset.Initialize(inputSplats.Length, quality.formatPos, quality.formatScale, quality.formatColor, quality.formatSH, boundsMin, boundsMax, null);
+
+                // Load the binary data files that were just created
+                LoadBinaryData(cacheFolder, asset);
 
                 OnProgress?.Invoke("Complete", 1.0f);
                 OnComplete?.Invoke(asset, true);
@@ -372,22 +427,135 @@ namespace GaussianSplatting.Runtime
 
         static void CreateChunkData(NativeArray<InputSplatData> splatData, string filePath)
         {
-            // Simplified chunk creation - writes chunk count and minimal headers
-            // Full implementation would require the complete CalcChunkDataJob from editor
-            using var fs = new FileStream(filePath, FileMode.Create, FileAccess.Write);
             int chunkCount = (splatData.Length + GaussianSplatAsset.kChunkSize - 1) / GaussianSplatAsset.kChunkSize;
-            // Write placeholder chunks
-            for (int i = 0; i < chunkCount; i++)
+            NativeArray<GaussianSplatAsset.ChunkInfo> chunks = new(chunkCount, Allocator.TempJob);
+            
+            // Process each chunk to calculate bounds
+            for (int chunkIdx = 0; chunkIdx < chunkCount; chunkIdx++)
             {
-                byte[] chunk = new byte[sizeof(float) * 16]; // Minimal chunk info
-                fs.Write(chunk, 0, chunk.Length);
+                float3 chunkMinpos = float.PositiveInfinity;
+                float3 chunkMinscl = float.PositiveInfinity;
+                float4 chunkMincol = float.PositiveInfinity;
+                float3 chunkMinshs = float.PositiveInfinity;
+                float3 chunkMaxpos = float.NegativeInfinity;
+                float3 chunkMaxscl = float.NegativeInfinity;
+                float4 chunkMaxcol = float.NegativeInfinity;
+                float3 chunkMaxshs = float.NegativeInfinity;
+
+                int splatBegin = math.min(chunkIdx * GaussianSplatAsset.kChunkSize, splatData.Length);
+                int splatEnd = math.min((chunkIdx + 1) * GaussianSplatAsset.kChunkSize, splatData.Length);
+
+                // Calculate bounds for this chunk
+                for (int i = splatBegin; i < splatEnd; ++i)
+                {
+                    InputSplatData s = splatData[i];
+                    float3 scale = math.pow(s.scale, 1.0f / 8.0f);
+                    float opacity = SquareCentered01(s.opacity);
+
+                    chunkMinpos = math.min(chunkMinpos, s.pos);
+                    chunkMinscl = math.min(chunkMinscl, scale);
+                    chunkMincol = math.min(chunkMincol, new float4(s.dc0, opacity));
+                    chunkMinshs = math.min(chunkMinshs, s.sh1);
+                    chunkMinshs = math.min(chunkMinshs, s.sh2);
+                    chunkMinshs = math.min(chunkMinshs, s.sh3);
+                    chunkMinshs = math.min(chunkMinshs, s.sh4);
+                    chunkMinshs = math.min(chunkMinshs, s.sh5);
+                    chunkMinshs = math.min(chunkMinshs, s.sh6);
+                    chunkMinshs = math.min(chunkMinshs, s.sh7);
+                    chunkMinshs = math.min(chunkMinshs, s.sh8);
+                    chunkMinshs = math.min(chunkMinshs, s.sh9);
+                    chunkMinshs = math.min(chunkMinshs, s.shA);
+                    chunkMinshs = math.min(chunkMinshs, s.shB);
+                    chunkMinshs = math.min(chunkMinshs, s.shC);
+                    chunkMinshs = math.min(chunkMinshs, s.shD);
+                    chunkMinshs = math.min(chunkMinshs, s.shE);
+                    chunkMinshs = math.min(chunkMinshs, s.shF);
+
+                    chunkMaxpos = math.max(chunkMaxpos, s.pos);
+                    chunkMaxscl = math.max(chunkMaxscl, scale);
+                    chunkMaxcol = math.max(chunkMaxcol, new float4(s.dc0, opacity));
+                    chunkMaxshs = math.max(chunkMaxshs, s.sh1);
+                    chunkMaxshs = math.max(chunkMaxshs, s.sh2);
+                    chunkMaxshs = math.max(chunkMaxshs, s.sh3);
+                    chunkMaxshs = math.max(chunkMaxshs, s.sh4);
+                    chunkMaxshs = math.max(chunkMaxshs, s.sh5);
+                    chunkMaxshs = math.max(chunkMaxshs, s.sh6);
+                    chunkMaxshs = math.max(chunkMaxshs, s.sh7);
+                    chunkMaxshs = math.max(chunkMaxshs, s.sh8);
+                    chunkMaxshs = math.max(chunkMaxshs, s.sh9);
+                    chunkMaxshs = math.max(chunkMaxshs, s.shA);
+                    chunkMaxshs = math.max(chunkMaxshs, s.shB);
+                    chunkMaxshs = math.max(chunkMaxshs, s.shC);
+                    chunkMaxshs = math.max(chunkMaxshs, s.shD);
+                    chunkMaxshs = math.max(chunkMaxshs, s.shE);
+                    chunkMaxshs = math.max(chunkMaxshs, s.shF);
+                }
+
+                // Ensure bounds are not zero
+                chunkMaxpos = math.max(chunkMaxpos, chunkMinpos + 1.0e-5f);
+                chunkMaxscl = math.max(chunkMaxscl, chunkMinscl + 1.0e-5f);
+                chunkMaxcol = math.max(chunkMaxcol, chunkMincol + 1.0e-5f);
+                chunkMaxshs = math.max(chunkMaxshs, chunkMinshs + 1.0e-5f);
+
+                // Store chunk info
+                GaussianSplatAsset.ChunkInfo info = default;
+                info.posX = new float2(chunkMinpos.x, chunkMaxpos.x);
+                info.posY = new float2(chunkMinpos.y, chunkMaxpos.y);
+                info.posZ = new float2(chunkMinpos.z, chunkMaxpos.z);
+                info.sclX = math.f32tof16(chunkMinscl.x) | (math.f32tof16(chunkMaxscl.x) << 16);
+                info.sclY = math.f32tof16(chunkMinscl.y) | (math.f32tof16(chunkMaxscl.y) << 16);
+                info.sclZ = math.f32tof16(chunkMinscl.z) | (math.f32tof16(chunkMaxscl.z) << 16);
+                info.colR = math.f32tof16(chunkMincol.x) | (math.f32tof16(chunkMaxcol.x) << 16);
+                info.colG = math.f32tof16(chunkMincol.y) | (math.f32tof16(chunkMaxcol.y) << 16);
+                info.colB = math.f32tof16(chunkMincol.z) | (math.f32tof16(chunkMaxcol.z) << 16);
+                info.colA = math.f32tof16(chunkMincol.w) | (math.f32tof16(chunkMaxcol.w) << 16);
+                info.shR = math.f32tof16(chunkMinshs.x) | (math.f32tof16(chunkMaxshs.x) << 16);
+                info.shG = math.f32tof16(chunkMinshs.y) | (math.f32tof16(chunkMaxshs.y) << 16);
+                info.shB = math.f32tof16(chunkMinshs.z) | (math.f32tof16(chunkMaxshs.z) << 16);
+                chunks[chunkIdx] = info;
+
+                // Normalize splat data to 0..1 within chunk bounds (matches editor behavior)
+                for (int i = splatBegin; i < splatEnd; ++i)
+                {
+                    InputSplatData s = splatData[i];
+                    s.pos = ((float3)s.pos - chunkMinpos) / (chunkMaxpos - chunkMinpos);
+                    s.scale = ((float3)s.scale - chunkMinscl) / (chunkMaxscl - chunkMinscl);
+                    s.dc0 = ((float3)s.dc0 - chunkMincol.xyz) / (chunkMaxcol.xyz - chunkMincol.xyz);
+                    s.opacity = (s.opacity - chunkMincol.w) / (chunkMaxcol.w - chunkMincol.w);
+                    s.sh1 = ((float3)s.sh1 - chunkMinshs) / (chunkMaxshs - chunkMinshs);
+                    s.sh2 = ((float3)s.sh2 - chunkMinshs) / (chunkMaxshs - chunkMinshs);
+                    s.sh3 = ((float3)s.sh3 - chunkMinshs) / (chunkMaxshs - chunkMinshs);
+                    s.sh4 = ((float3)s.sh4 - chunkMinshs) / (chunkMaxshs - chunkMinshs);
+                    s.sh5 = ((float3)s.sh5 - chunkMinshs) / (chunkMaxshs - chunkMinshs);
+                    s.sh6 = ((float3)s.sh6 - chunkMinshs) / (chunkMaxshs - chunkMinshs);
+                    s.sh7 = ((float3)s.sh7 - chunkMinshs) / (chunkMaxshs - chunkMinshs);
+                    s.sh8 = ((float3)s.sh8 - chunkMinshs) / (chunkMaxshs - chunkMinshs);
+                    s.sh9 = ((float3)s.sh9 - chunkMinshs) / (chunkMaxshs - chunkMinshs);
+                    s.shA = ((float3)s.shA - chunkMinshs) / (chunkMaxshs - chunkMinshs);
+                    s.shB = ((float3)s.shB - chunkMinshs) / (chunkMaxshs - chunkMinshs);
+                    s.shC = ((float3)s.shC - chunkMinshs) / (chunkMaxshs - chunkMinshs);
+                    s.shD = ((float3)s.shD - chunkMinshs) / (chunkMaxshs - chunkMinshs);
+                    s.shE = ((float3)s.shE - chunkMinshs) / (chunkMaxshs - chunkMinshs);
+                    s.shF = ((float3)s.shF - chunkMinshs) / (chunkMaxshs - chunkMinshs);
+                    splatData[i] = s;
+                }
             }
+
+            // Write chunks to file
+            using var fs = new FileStream(filePath, FileMode.Create, FileAccess.Write);
+            unsafe
+            {
+                fs.Write(new ReadOnlySpan<byte>((void*)chunks.GetUnsafePtr(), chunks.Length * UnsafeUtility.SizeOf<GaussianSplatAsset.ChunkInfo>()));
+            }
+            chunks.Dispose();
         }
 
         static void CreatePositionsData(NativeArray<InputSplatData> splatData, string filePath, GaussianSplatAsset.VectorFormat format)
         {
             int formatSize = GaussianSplatAsset.GetVectorSize(format);
             int dataLen = splatData.Length * formatSize;
+            // Align to 8-byte boundary (matching editor version)
+            dataLen = (dataLen + 7) / 8 * 8;
             
             using var fs = new FileStream(filePath, FileMode.Create, FileAccess.Write);
             unsafe
@@ -397,6 +565,13 @@ namespace GaussianSplatting.Runtime
                     var pos = (Vector3)splatData[i].pos;
                     byte[] data = EncodeVector(pos, format);
                     fs.Write(data, 0, data.Length);
+                }
+                // Write padding to align to 8 bytes
+                int paddingSize = dataLen - (splatData.Length * formatSize);
+                if (paddingSize > 0)
+                {
+                    byte[] padding = new byte[paddingSize];
+                    fs.Write(padding, 0, paddingSize);
                 }
             }
         }
@@ -421,14 +596,58 @@ namespace GaussianSplatting.Runtime
 
         static void CreateColorData(NativeArray<InputSplatData> splatData, string filePath, GaussianSplatAsset.ColorFormat format)
         {
-            using var fs = new FileStream(filePath, FileMode.Create, FileAccess.Write);
+            // Create texture-sized buffer with proper swizzling (same as editor)
+            var (texWidth, texHeight) = GaussianSplatAsset.CalcTextureSize(splatData.Length);
+            int colorSize = GaussianSplatAsset.GetColorSize(format);
+            int textureTotalSize = texWidth * texHeight * colorSize;
+            byte[] textureData = new byte[textureTotalSize];
+
+            // Map each splat to its texture position and encode
             for (int i = 0; i < splatData.Length; i++)
             {
                 var splat = splatData[i];
-                var color = new Vector4(splat.dc0.x, splat.dc0.y, splat.dc0.z, splat.opacity);
-                byte[] data = EncodeColor(color, format);
-                fs.Write(data, 0, data.Length);
+                var color = new float4(splat.dc0.x, splat.dc0.y, splat.dc0.z, splat.opacity);
+                byte[] colorBytes = EncodeColor(color, format);
+
+                if (colorBytes.Length != colorSize)
+                {
+                    UnityEngine.Debug.LogError($"EncodeColor returned {colorBytes.Length} bytes but expected {colorSize} for format {format}");
+                    System.Array.Resize(ref colorBytes, colorSize);
+                }
+
+                // Get texture position for this splat (with Morton swizzling)
+                int texPos = SplatIndexToTextureIndex(i, texWidth);
+                int byteOffset = texPos * colorSize;
+
+                if (byteOffset >= 0 && byteOffset + colorSize <= textureTotalSize)
+                {
+                    System.Array.Copy(colorBytes, 0, textureData, byteOffset, colorSize);
+                }
             }
+
+            // Write the full texture buffer to file
+            using var fs = new FileStream(filePath, FileMode.Create, FileAccess.Write);
+            fs.Write(textureData, 0, textureData.Length);
+        }
+
+        static int SplatIndexToTextureIndex(int idx, int texWidth)
+        {
+            // Decode Morton code for 16x16 tiles
+            uint2 xy = DecodeMorton2D_16x16((uint)idx);
+            uint width = (uint)(texWidth / 16);
+            uint idx_shifted = (uint)idx >> 8;
+            uint x = (idx_shifted % width) * 16 + xy.x;
+            uint y = (idx_shifted / width) * 16 + xy.y;
+            return (int)(y * texWidth + x);
+        }
+
+        static uint2 DecodeMorton2D_16x16(uint t)
+        {
+            t = (t & 0xFF) | ((t & 0xFE) << 7); // -EAFBGCHEAFBGCHD
+            t &= 0x5555;                        // -E-F-G-H-A-B-C-D
+            t = (t ^ (t >> 1)) & 0x3333;        // --EF--GH--AB--CD
+            t = (t ^ (t >> 2)) & 0x0f0f;        // ----EFGH----ABCD
+            return new uint2(t & 0xF, t >> 8);  // --------EFGHABCD
         }
 
         static void CreateSHData(NativeArray<InputSplatData> splatData, string filePath, GaussianSplatAsset.SHFormat format)
@@ -460,7 +679,7 @@ namespace GaussianSplatting.Runtime
 
         static void WriteSHFloat32(FileStream fs, InputSplatData splat)
         {
-            Vector3[] shCoeffs = { splat.sh1, splat.sh2, splat.sh3, splat.sh4, splat.sh5, splat.sh6, 
+            float3[] shCoeffs = { splat.sh1, splat.sh2, splat.sh3, splat.sh4, splat.sh5, splat.sh6, 
                                   splat.sh7, splat.sh8, splat.sh9, splat.shA, splat.shB, splat.shC, 
                                   splat.shD, splat.shE, splat.shF };
             foreach (var sh in shCoeffs)
@@ -477,16 +696,17 @@ namespace GaussianSplatting.Runtime
 
         static void WriteSHFloat16(FileStream fs, InputSplatData splat)
         {
-            // Convert to float16 (half precision) - simplified
-            Vector3[] shCoeffs = { splat.sh1, splat.sh2, splat.sh3, splat.sh4, splat.sh5, splat.sh6, 
+            // Convert to float16 (half precision) using proper bit-level conversion
+            float3[] shCoeffs = { splat.sh1, splat.sh2, splat.sh3, splat.sh4, splat.sh5, splat.sh6, 
                                   splat.sh7, splat.sh8, splat.sh9, splat.shA, splat.shB, splat.shC, 
                                   splat.shD, splat.shE, splat.shF };
             foreach (var sh in shCoeffs)
             {
-                fs.Write(BitConverter.GetBytes((ushort)0), 0, 2); // Placeholder for float16
-                fs.Write(BitConverter.GetBytes((ushort)0), 0, 2);
-                fs.Write(BitConverter.GetBytes((ushort)0), 0, 2);
+                fs.Write(BitConverter.GetBytes(FloatToHalf(sh.x)), 0, 2);
+                fs.Write(BitConverter.GetBytes(FloatToHalf(sh.y)), 0, 2);
+                fs.Write(BitConverter.GetBytes(FloatToHalf(sh.z)), 0, 2);
             }
+            // Padding
             fs.Write(BitConverter.GetBytes((ushort)0), 0, 2);
             fs.Write(BitConverter.GetBytes((ushort)0), 0, 2);
             fs.Write(BitConverter.GetBytes((ushort)0), 0, 2);
@@ -494,7 +714,7 @@ namespace GaussianSplatting.Runtime
 
         static void WriteSHNorm11(FileStream fs, InputSplatData splat)
         {
-            Vector3[] shCoeffs = { splat.sh1, splat.sh2, splat.sh3, splat.sh4, splat.sh5, splat.sh6, 
+            float3[] shCoeffs = { splat.sh1, splat.sh2, splat.sh3, splat.sh4, splat.sh5, splat.sh6, 
                                   splat.sh7, splat.sh8, splat.sh9, splat.shA, splat.shB, splat.shC, 
                                   splat.shD, splat.shE, splat.shF };
             foreach (var sh in shCoeffs)
@@ -505,7 +725,7 @@ namespace GaussianSplatting.Runtime
 
         static void WriteSHNorm6(FileStream fs, InputSplatData splat)
         {
-            Vector3[] shCoeffs = { splat.sh1, splat.sh2, splat.sh3, splat.sh4, splat.sh5, splat.sh6, 
+            float3[] shCoeffs = { splat.sh1, splat.sh2, splat.sh3, splat.sh4, splat.sh5, splat.sh6, 
                                   splat.sh7, splat.sh8, splat.sh9, splat.shA, splat.shB, splat.shC, 
                                   splat.shD, splat.shE, splat.shF };
             foreach (var sh in shCoeffs)
@@ -519,7 +739,7 @@ namespace GaussianSplatting.Runtime
 
         #region Encoding Helpers
 
-        static byte[] EncodeVector(Vector3 v, GaussianSplatAsset.VectorFormat format)
+        static byte[] EncodeVector(float3 v, GaussianSplatAsset.VectorFormat format)
         {
             return format switch
             {
@@ -534,7 +754,7 @@ namespace GaussianSplatting.Runtime
             };
         }
 
-        static byte[] EncodeNorm16(Vector3 v)
+        static byte[] EncodeNorm16(float3 v)
         {
             ulong val = EncodeFloat3ToNorm16(v);
             byte[] result = new byte[6];
@@ -547,33 +767,76 @@ namespace GaussianSplatting.Runtime
             return result;
         }
 
-        static byte[] EncodeColor(Vector4 c, GaussianSplatAsset.ColorFormat format)
+        static byte[] EncodeColor(float4 color, GaussianSplatAsset.ColorFormat format)
         {
             return format switch
             {
                 GaussianSplatAsset.ColorFormat.Float32x4 => ConcatBytes(
-                    BitConverter.GetBytes(c.x),
-                    BitConverter.GetBytes(c.y),
-                    BitConverter.GetBytes(c.z),
-                    BitConverter.GetBytes(c.w)),
-                GaussianSplatAsset.ColorFormat.Float16x4 => EncodeHalf4(c),
+                    BitConverter.GetBytes(color.x),
+                    BitConverter.GetBytes(color.y),
+                    BitConverter.GetBytes(color.z),
+                    BitConverter.GetBytes(color.w)),
+                GaussianSplatAsset.ColorFormat.Float16x4 => EncodeHalf4(color),
                 GaussianSplatAsset.ColorFormat.Norm8x4 => new byte[] 
                 { 
-                    (byte)(Mathf.Clamp01(c.x) * 255), 
-                    (byte)(Mathf.Clamp01(c.y) * 255), 
-                    (byte)(Mathf.Clamp01(c.z) * 255), 
-                    (byte)(Mathf.Clamp01(c.w) * 255) 
+                    (byte)(math.saturate(color.x) * 255), 
+                    (byte)(math.saturate(color.y) * 255), 
+                    (byte)(math.saturate(color.z) * 255), 
+                    (byte)(math.saturate(color.w) * 255) 
                 },
                 _ => new byte[0]
             };
         }
 
-        static byte[] EncodeHalf4(Vector4 c)
+        static byte[] EncodeHalf4(float4 color)
         {
-            // Placeholder for float16 encoding - would need Unity.Mathematics.half
+            // Proper Float16 (half precision) encoding using bit-level conversion
             byte[] result = new byte[8];
-            for (int i = 0; i < 8; i++) result[i] = 0;
+            unsafe
+            {
+                fixed (byte* ptr = result)
+                {
+                    ushort* halfPtr = (ushort*)ptr;
+                    halfPtr[0] = FloatToHalf(color.x);
+                    halfPtr[1] = FloatToHalf(color.y);
+                    halfPtr[2] = FloatToHalf(color.z);
+                    halfPtr[3] = FloatToHalf(color.w);
+                }
+            }
             return result;
+        }
+
+        // Convert float32 to float16 (half precision) using IEEE 754 bit manipulation
+        static ushort FloatToHalf(float value)
+        {
+            unsafe
+            {
+                uint bits = *(uint*)&value;
+                uint sign = bits >> 31;
+                uint exponent = (bits >> 23) & 0xFF;
+                uint mantissa = bits & 0x7FFFFF;
+
+                // Handle special cases
+                if (exponent == 255) // Inf or NaN
+                    return (ushort)((sign << 15) | 0x7FFF);
+                
+                if (exponent == 0) // Zero or subnormal
+                    return (ushort)(sign << 15);
+
+                // Bias adjustment: float32 bias is 127, float16 bias is 15
+                int newExponent = (int)exponent - 127 + 15;
+
+                if (newExponent >= 31) // Overflow to infinity
+                    return (ushort)((sign << 15) | 0x7C00);
+                
+                if (newExponent <= 0) // Underflow to zero
+                    return (ushort)(sign << 15);
+
+                // Truncate mantissa from 23 bits to 10 bits
+                uint newMantissa = mantissa >> 13;
+                
+                return (ushort)((sign << 15) | ((uint)newExponent << 10) | newMantissa);
+            }
         }
 
         static byte[] ConcatBytes(params byte[][] arrays)
@@ -592,17 +855,24 @@ namespace GaussianSplatting.Runtime
             return result;
         }
 
-        static ulong EncodeFloat3ToNorm16(Vector3 v)
+        static ulong EncodeFloat3ToNorm16(float3 v)
         {
             return (ulong)(v.x * 65535.5f) | ((ulong)(v.y * 65535.5f) << 16) | ((ulong)(v.z * 65535.5f) << 32);
         }
 
-        static uint EncodeFloat3ToNorm11(Vector3 v)
+        static float SquareCentered01(float x)
+        {
+            // Transform value centered at 0.5 to be more uniformly distributed
+            x = x - 0.5f;
+            return x * x * 4.0f + 0.5f;
+        }
+
+        static uint EncodeFloat3ToNorm11(float3 v)
         {
             return (uint)(v.x * 2047.5f) | ((uint)(v.y * 1023.5f) << 11) | ((uint)(v.z * 2047.5f) << 21);
         }
 
-        static ushort EncodeFloat3ToNorm655(Vector3 v)
+        static ushort EncodeFloat3ToNorm655(float3 v)
         {
             return (ushort)((uint)(v.x * 63.5f) | ((uint)(v.y * 31.5f) << 6) | ((uint)(v.z * 31.5f) << 11));
         }

@@ -46,11 +46,11 @@ namespace GaussianSplatting.Editor
             EditorGUILayout.IntField("Version", gs.formatVersion);
             GUI.backgroundColor = prevBackColor;
 
-            long sizePos = gs.posData != null ? gs.posData.dataSize : 0;
-            long sizeOther = gs.otherData != null ? gs.otherData.dataSize : 0;
-            long sizeCol = gs.colorData != null ? gs.colorData.dataSize : 0;
+            long sizePos = gs.posData != null ? gs.posData.GetDataSize() : 0;
+            long sizeOther = gs.otherData != null ? gs.otherData.GetDataSize() : 0;
+            long sizeCol = gs.colorData != null ? gs.colorData.GetDataSize() : 0;
             long sizeSH = GaussianSplatAsset.CalcSHDataSize(gs.splatCount, gs.shFormat);
-            long sizeChunk = gs.chunkData != null ? gs.chunkData.dataSize : 0;
+            long sizeChunk = gs.chunkData != null ? gs.chunkData.GetDataSize() : 0;
 
             EditorGUILayout.TextField("Memory", EditorUtility.FormatBytes(sizePos + sizeOther + sizeSH + sizeCol + sizeChunk));
             EditorGUI.indentLevel++;
