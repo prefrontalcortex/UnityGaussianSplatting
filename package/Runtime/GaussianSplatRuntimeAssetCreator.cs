@@ -66,7 +66,15 @@ namespace GaussianSplatting.Runtime
         public event ProgressCallback OnProgress;
         public event CompleteCallback OnComplete;
 
-        // Quality preset (fixed to "High" as per requirements)
+        // Quality presets
+        public enum QualityPreset
+        {
+            VeryHigh,
+            High,
+            Medium,
+            Low
+        }
+
         struct QualitySettings
         {
             public GaussianSplatAsset.VectorFormat formatPos;
@@ -75,6 +83,14 @@ namespace GaussianSplatting.Runtime
             public GaussianSplatAsset.SHFormat formatSH;
         }
 
+        static readonly QualitySettings kVeryHighQuality = new()
+        {
+            formatPos = GaussianSplatAsset.VectorFormat.Float32,
+            formatScale = GaussianSplatAsset.VectorFormat.Float32,
+            formatColor = GaussianSplatAsset.ColorFormat.Float32x4,
+            formatSH = GaussianSplatAsset.SHFormat.Float32
+        };
+
         static readonly QualitySettings kHighQuality = new()
         {
             formatPos = GaussianSplatAsset.VectorFormat.Norm16,
@@ -82,6 +98,24 @@ namespace GaussianSplatting.Runtime
             formatColor = GaussianSplatAsset.ColorFormat.Float16x4,
             formatSH = GaussianSplatAsset.SHFormat.Norm11
         };
+
+        static readonly QualitySettings kMediumQuality = new()
+        {
+            formatPos = GaussianSplatAsset.VectorFormat.Norm11,
+            formatScale = GaussianSplatAsset.VectorFormat.Norm11,
+            formatColor = GaussianSplatAsset.ColorFormat.Norm8x4,
+            formatSH = GaussianSplatAsset.SHFormat.Norm6
+        };
+
+        static readonly QualitySettings kLowQuality = new()
+        {
+            formatPos = GaussianSplatAsset.VectorFormat.Norm6,
+            formatScale = GaussianSplatAsset.VectorFormat.Norm6,
+            formatColor = GaussianSplatAsset.ColorFormat.Norm8x4,
+            formatSH = GaussianSplatAsset.SHFormat.Norm6
+        };
+
+        [SerializeField] QualityPreset m_QualityPreset = QualityPreset.High;
 
         [System.Serializable]
         class AssetMetadata
@@ -97,6 +131,26 @@ namespace GaussianSplatting.Runtime
             public float boundsMinX, boundsMinY, boundsMinZ;
             public float boundsMaxX, boundsMaxY, boundsMaxZ;
         }
+
+        QualitySettings GetQualitySettings()
+        {
+            return m_QualityPreset switch
+            {
+                QualityPreset.VeryHigh => kVeryHighQuality,
+                QualityPreset.High => kHighQuality,
+                QualityPreset.Medium => kMediumQuality,
+                QualityPreset.Low => kLowQuality,
+                _ => kHighQuality
+            };
+        }
+
+        /// <summary>Get or set the quality preset for asset processing</summary>
+        public QualityPreset QualityLevel
+        {
+            get => m_QualityPreset;
+            set => m_QualityPreset = value;
+        }
+
 
         string GetCachePath(string assetName)
         {
@@ -263,11 +317,10 @@ namespace GaussianSplatting.Runtime
 
                 // Create output directory
                 Directory.CreateDirectory(cacheFolder);
-
                 OnProgress?.Invoke("Creating data files", 0.5f);
 
-                // Use high quality preset (fixed)
-                QualitySettings quality = kHighQuality;
+                // Use selected quality preset
+                QualitySettings quality = GetQualitySettings();
 
                 bool useChunks = quality.formatPos != GaussianSplatAsset.VectorFormat.Float32 ||
                                quality.formatScale != GaussianSplatAsset.VectorFormat.Float32 ||
