@@ -16,6 +16,17 @@ namespace GaussianSplatting.Runtime.Utils
     // https://scaniverse.com/spz
     public static class SPZFileReader
     {
+        /// <summary>
+        /// Reports the number of suppressed SH warnings (call after import if needed).
+        /// </summary>
+        public static void ReportSuppressedShWarnings()
+        {
+            int count = UnpackDataJob.GetShWarningCount();
+            if (count > 0)
+            {
+                Debug.LogWarning($"[SPZFileReader] Total suppressed SH data warnings: {count}");
+            }
+        }
         struct SpzHeader {
             public uint magic; // 0x5053474e "NGSP"
             public uint version; // 2
@@ -184,8 +195,21 @@ namespace GaussianSplatting.Runtime.Utils
                 return fx;
             }
 
+            static int shWarningCount = 0;
+            static int shWarningLogStep = 100000;
+            public static int GetShWarningCount() => shWarningCount;
+            public static void ResetShWarningCount() => shWarningCount = 0;
             Vector3 UnpackSH(int idx)
             {
+                if (packedSh.Length == 0 || idx < 0 || idx + 2 >= packedSh.Length)
+                {
+                    int count = System.Threading.Interlocked.Increment(ref shWarningCount);
+                    if (count % shWarningLogStep == 1)
+                    {
+                        Debug.LogWarning($"[SPZFileReader] SH data missing or out of bounds: idx={idx}, packedSh.Length={packedSh.Length} (showing every {shWarningLogStep}th warning, total so far: {count})");
+                    }
+                    return Vector3.zero;
+                }
                 Vector3 sh = new Vector3(packedSh[idx], packedSh[idx + 1], packedSh[idx + 2]) - new Vector3(128.0f, 128.0f, 128.0f);
                 sh /= 128.0f;
                 return sh;
