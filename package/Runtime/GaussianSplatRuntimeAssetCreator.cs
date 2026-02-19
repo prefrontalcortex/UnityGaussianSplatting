@@ -80,6 +80,19 @@ namespace GaussianSplatting.Runtime
 
     public class GaussianSplatRuntimeAssetCreator : MonoBehaviour
     {
+        /// <summary>
+        /// Optional base path for cache storage. If not set, defaults to Application.persistentDataPath/GaussianSplats.
+        /// </summary>
+        public string CacheBasePath = null;
+
+        /// <summary>
+        /// Call this to set the cache base path and log the assignment for debugging.
+        /// </summary>
+        public void SetCacheBasePath(string path)
+        {
+            CacheBasePath = path;
+            Debug.Log($"[GSplat] Set CacheBasePath='{CacheBasePath}', instanceID={this.GetInstanceID()}");
+        }
         public delegate void ProgressCallback(string status, float progress);
         public delegate void CompleteCallback(GaussianSplatAsset asset, bool success);
 
@@ -372,7 +385,12 @@ namespace GaussianSplatting.Runtime
 
         string GetCachePath(string assetName)
         {
-            return Path.Combine(Application.persistentDataPath, "GaussianSplats", assetName);
+            string basePath = string.IsNullOrEmpty(CacheBasePath)
+                ? Path.Combine(Application.persistentDataPath, "GaussianSplats")
+                : CacheBasePath;
+            string fullPath = Path.Combine(basePath, assetName);
+            Debug.Log($"[GSplat] GetCachePath: assetName='" + assetName + "', CacheBasePath='" + CacheBasePath + "', resolved='" + fullPath + "', this instanceID=" + this.GetInstanceID());
+            return fullPath;
         }
 
         bool IsCached(string assetName)
@@ -513,7 +531,8 @@ namespace GaussianSplatting.Runtime
         }
 
         bool ProcessAndCacheInternal(string assetName, string cacheFolder, string sourceFile = null)
-        {
+                {
+                    Debug.Log("[GSplat] ProcessAndCacheInternal: CacheBasePath=" + CacheBasePath + ", instanceID=" + this.GetInstanceID());
             NativeArray<InputSplatData> inputSplats = default;
 
             try
