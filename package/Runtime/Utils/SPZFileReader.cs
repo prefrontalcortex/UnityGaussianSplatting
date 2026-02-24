@@ -45,20 +45,27 @@ namespace GaussianSplatting.Runtime.Utils
 
         static void ReadHeaderImpl(string filePath, Stream fs, out int vertexCount, out int shLevel, out int fractBits, out int flags)
         {
-            var header = new NativeArray<SpzHeader>(1, Allocator.Temp);
-            var readBytes = fs.Read(header.Reinterpret<byte>(16));
-            if (readBytes != 16)
-                throw new IOException($"SPZ {filePath} read error, failed to read header");
-
-            if (header[0].magic != 0x5053474e)
-                throw new IOException($"SPZ {filePath} read error, header magic unexpected {header[0].magic}");
-            if (header[0].version != 2)
-                throw new IOException($"SPZ {filePath} read error, header version unexpected {header[0].version}");
-
-            vertexCount = (int)header[0].numPoints;
-            shLevel = (int)(header[0].sh_fracbits_flags_reserved & 0xFF);
-            fractBits = (int)((header[0].sh_fracbits_flags_reserved >> 8) & 0xFF);
-            flags = (int)((header[0].sh_fracbits_flags_reserved >> 16) & 0xFF);
+            // Read header using byte-sequential reading (matches spz-js format)
+            using var reader = new System.IO.BinaryReader(fs, System.Text.Encoding.UTF8, leaveOpen: true);
+            
+            uint magic = reader.ReadUInt32();
+            if (magic != 0x5053474e)
+                throw new IOException($"SPZ {filePath} read error, header magic unexpected {magic:X}");
+                
+            uint version = reader.ReadUInt32();
+            if (version != 2)
+                throw new IOException($"SPZ {filePath} read error, header version unexpected {version}");
+                
+            uint numPoints = reader.ReadUInt32();
+            byte shDegree = reader.ReadByte();         // Read as individual bytes!
+            byte fractionalBits = reader.ReadByte();   // Not as packed uint32!
+            byte flagsByte = reader.ReadByte();
+            byte reserved = reader.ReadByte();
+            
+            vertexCount = (int)numPoints;
+            shLevel = shDegree;         // shDegree IS shLevel
+            fractBits = fractionalBits;
+            flags = flagsByte;
         }
 
         static int SHCoeffsForLevel(int level)
@@ -81,8 +88,14 @@ namespace GaussianSplatting.Runtime.Utils
 
             if (splatCount < 1 || splatCount > 10_000_000) // 10M hardcoded in SPZ code
                 throw new IOException($"SPZ {filePath} read error, out of range splat count {splatCount}");
+            
+            // Note: shLevel=0 is valid (no SH data, DC color only)
+            // This is common for full_res SPZ files - use PLY conversion for full SH data
             if (shLevel < 0 || shLevel > 3)
+            {
                 throw new IOException($"SPZ {filePath} read error, out of range SH level {shLevel}");
+            }
+            
             if (fractBits < 0 || fractBits > 24)
                 throw new IOException($"SPZ {filePath} read error, out of range fractional bits {fractBits}");
 
@@ -201,12 +214,19 @@ namespace GaussianSplatting.Runtime.Utils
             public static void ResetShWarningCount() => shWarningCount = 0;
             Vector3 UnpackSH(int idx)
             {
-                if (packedSh.Length == 0 || idx < 0 || idx + 2 >= packedSh.Length)
+                // If file has no SH data (shLevel=0), packedSh.Length will be 0 - this is valid
+                if (packedSh.Length == 0)
+                {
+                    return Vector3.zero;  // No SH data = neutral (only DC color used)
+                }
+                
+                // If we have SH data but index is out of bounds, this is an error
+                if (idx < 0 || idx + 2 >= packedSh.Length)
                 {
                     int count = System.Threading.Interlocked.Increment(ref shWarningCount);
                     if (count % shWarningLogStep == 1)
                     {
-                        Debug.LogWarning($"[SPZFileReader] SH data missing or out of bounds: idx={idx}, packedSh.Length={packedSh.Length} (showing every {shWarningLogStep}th warning, total so far: {count})");
+                        Debug.LogWarning($"[SPZFileReader] SH index out of bounds: idx={idx}, packedSh.Length={packedSh.Length} (showing every {shWarningLogStep}th warning, total so far: {count})");
                     }
                     return Vector3.zero;
                 }
