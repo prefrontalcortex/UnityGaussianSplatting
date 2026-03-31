@@ -418,22 +418,14 @@ namespace GaussianSplatting.Runtime
 
         bool TryLoadFromCache(string assetName, string cacheFolder, out GaussianSplatAsset asset)
         {
-            Debug.Log($"[GSplat] TryLoadFromCache: assetName='{assetName}', cacheFolder='{cacheFolder}'");
             asset = null;
 
             if (!Directory.Exists(cacheFolder))
-            {
-                Debug.Log($"[GSplat] Cache folder does not exist: {cacheFolder}");
                 return false;
-            }
 
             string metadataPath = Path.Combine(cacheFolder, "metadata.json");
-            Debug.Log($"[GSplat] Looking for metadata at: {metadataPath}");
             if (!File.Exists(metadataPath))
-            {
-                Debug.Log($"[GSplat] Metadata file not found!");
                 return false;
-            }
 
             try
             {
